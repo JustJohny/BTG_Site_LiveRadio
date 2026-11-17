@@ -113,6 +113,26 @@
     gap: 8px; text-transform: uppercase; transition: background 0.15s;
   }
   .rc-download-btn:hover { background: var(--card-high); }
+  /* Live radio (send to the host's game) */
+  .rc-live { margin-top: 12px; }
+  .rc-live-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 12px; color: var(--rc-copy-soft); }
+  .rc-live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; margin-right: 6px; vertical-align: middle; }
+  .rc-live-dot.on { background: #2ecc71; }
+  .rc-live-dot.off { background: #e8002d; }
+  .rc-live-switch {
+    font-size: 11px; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--rc-edge-strong);
+    background: transparent; color: var(--rc-copy-soft); cursor: pointer; font-family: var(--head-face);
+    text-transform: uppercase; font-weight: 700; transition: all 0.15s; white-space: nowrap;
+  }
+  .rc-live-switch:hover { border-color: var(--rc-accent); color: var(--copy); }
+  .rc-send-btn { border-color: var(--rc-accent); }
+  .rc-send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .rc-live-result { min-height: 16px; margin-top: 8px; font-size: 12px; color: var(--rc-copy-soft); text-align: center; }
+  .rc-live-result.good { color: #2ecc71; }
+  .rc-live-result.bad { color: #ff5a6e; }
+  .rc-live-result a { color: inherit; }
+  .rc-live-login { margin-top: 8px; font-size: 12px; color: var(--rc-copy-soft); text-align: center; }
+  .rc-live-login a { color: var(--copy); }
   .rc-add-reply-btn {
     width: 100%; padding: 8px; border-radius: 6px; border: 1px dashed var(--rc-edge-strong);
     background: transparent; color: var(--rc-copy-soft); font-size: 12px; font-weight: 700;
@@ -206,6 +226,18 @@
       <input type="hidden" id="nameColor" value="#e8002d" />
 
       <button class="rc-download-btn" onclick="downloadCard()">Download Card</button>
+
+      <!-- Live radio: send this message to the series host's game -->
+      <div class="rc-section rc-live">
+        <div class="rc-section-title">Live Radio</div>
+        <div class="rc-live-row">
+          <span><span class="rc-live-dot" id="liveDot"></span><span id="liveStatus">Checking…</span></span>
+          <button class="rc-live-switch" id="liveSwitch" type="button" style="display:none" onclick="toggleLiveRadio()"></button>
+        </div>
+        <button class="rc-download-btn rc-send-btn" id="sendBtn" type="button" onclick="sendToGame()" disabled>Send to Game</button>
+        <div class="rc-live-login" id="liveLogin" style="display:none">Sending is for league members. <a href="BTG_DriverAttributes.html">Log in at the Driver Console</a>, then come back to this page.</div>
+        <div class="rc-live-result" id="liveResult"></div>
+      </div>
     </div>
 
     <div class="rc-preview-area">
@@ -917,6 +949,7 @@ function setSeries(series) {
   buildTeamPresets();
   const teams = TEAMS_BY_SERIES[activeSeries] || [];
   if (teams.length) selectTeam(teams[0]);
+  refreshLiveRadio();
 }
 function buildTeamPresets() {
   const teams = TEAMS_BY_SERIES[activeSeries] || [];
@@ -1089,6 +1122,185 @@ function buildReplySections() {
     container.appendChild(section);
   });
 }
+
+/* ─── live radio: send to the series host's game ───────────
+   The message is stored by the BTG backend (database functions radio_send /
+   radio_status / radio_set_enabled, see sql/radio-send-to-game.sql) and the
+   host's game mod picks it up within a couple of seconds. Sending needs a
+   league login from the Driver Console (kept in localStorage as btg_session).
+   When the page is opened from `node server.js` on this PC, a local stand-in
+   is used instead so the whole thing can be tried without the real backend. */
+const RADIO_LOCAL = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const RADIO_SUPABASE_URL = 'https://jocmjietuviegelluiev.supabase.co';
+const RADIO_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpvY21qaWV0dXZpZWdlbGx1aWV2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxNDc5NDQsImV4cCI6MjEwMjcyMzk0NH0.LOrbnYYc6iE0AZ_90NmRSBMGS1bF0qlyoEXRyf95c_0'; // publishable key, same one scripts/build-db-cache.js uses
+const RADIO_MAX_LINES = 4;
+const RADIO_MAX_CHARS = 140;
+const RADIO_COOLDOWN_MS = 10000;
+let liveEnabled = null;      // null = unknown
+let liveCooldownUntil = 0;
+let liveBusy = false;
+
+async function radioRpc(name, body) {
+  const url = RADIO_LOCAL ? '/api/radio-rpc/' + name : RADIO_SUPABASE_URL + '/rest/v1/rpc/' + name;
+  const headers = { 'Content-Type': 'application/json' };
+  if (!RADIO_LOCAL) { headers.apikey = RADIO_ANON_KEY; headers.Authorization = 'Bearer ' + RADIO_ANON_KEY; }
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) throw new Error('http ' + res.status);
+  return data;
+}
+
+function radioSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem('btg_session') || 'null');
+    return s && s.token ? s : null;
+  } catch (_) { return null; }
+}
+function radioNormSeries(s) {
+  const u = String(s || '').trim().toUpperCase();
+  return u === 'GT1' ? 'XGT' : u;
+}
+function radioCanSwitch() {
+  const s = radioSession();
+  if (!s) return false;
+  const role = String(s.role || '').toLowerCase();
+  return role === 'admin' || (role === 'seriesrunner' && radioNormSeries(s.series) === radioNormSeries(activeSeries));
+}
+function setLiveResult(text, kind, html) {
+  const el = document.getElementById('liveResult');
+  el.className = 'rc-live-result' + (kind ? ' ' + kind : '');
+  if (html) el.innerHTML = html; else el.textContent = text || '';
+}
+
+function updateLiveUi() {
+  const dot = document.getElementById('liveDot');
+  const status = document.getElementById('liveStatus');
+  const sw = document.getElementById('liveSwitch');
+  const btn = document.getElementById('sendBtn');
+  const name = seriesDisplayName(activeSeries) || 'this series';
+  dot.className = 'rc-live-dot' + (liveEnabled === true ? ' on' : liveEnabled === false ? ' off' : '');
+  status.textContent = liveEnabled === true ? name + ' live radio is on'
+    : liveEnabled === false ? name + ' live radio is off'
+    : 'Live radio status unknown';
+  if (radioCanSwitch() && liveEnabled !== null) {
+    sw.style.display = '';
+    sw.textContent = liveEnabled ? 'Turn off' : 'Turn on';
+  } else {
+    sw.style.display = 'none';
+  }
+  // Anyone can build and download a card; sending needs a league login.
+  const loggedIn = !!radioSession();
+  document.getElementById('liveLogin').style.display = loggedIn ? 'none' : '';
+  const wait = Math.ceil((liveCooldownUntil - Date.now()) / 1000);
+  btn.disabled = !loggedIn || liveBusy || liveEnabled !== true || wait > 0 || !activeSeries;
+  btn.textContent = !loggedIn ? 'Send to Game — log in first'
+    : wait > 0 ? 'Send to Game (' + wait + ')' : 'Send to Game';
+}
+
+async function refreshLiveRadio() {
+  if (!activeSeries) { liveEnabled = null; updateLiveUi(); return; }
+  const asked = activeSeries;
+  try {
+    const data = await radioRpc('radio_status', { p_series: asked });
+    if (asked !== activeSeries) return;
+    liveEnabled = !!(data && data.ok && data.enabled);
+  } catch (_) {
+    if (asked !== activeSeries) return;
+    liveEnabled = null;
+  }
+  updateLiveUi();
+}
+
+async function toggleLiveRadio() {
+  const s = radioSession();
+  if (!s || liveEnabled === null || liveBusy) return;
+  liveBusy = true; updateLiveUi();
+  try {
+    const data = await radioRpc('radio_set_enabled', { p_token: s.token, p_series: activeSeries, p_enabled: !liveEnabled });
+    if (data.ok) { liveEnabled = !!data.enabled; setLiveResult(''); }
+    else setLiveResult(radioErrorText(data), 'bad');
+  } catch (_) {
+    setLiveResult('Could not reach the server. Try again.', 'bad');
+  }
+  liveBusy = false; updateLiveUi();
+}
+
+function radioErrorText(data) {
+  switch (data && data.error) {
+    case 'radio_off': return 'Live radio is switched off for this series.';
+    case 'too_fast': return 'Wait a few seconds before sending again.';
+    case 'unauthorized': return 'Your login has expired. Log in again at the Driver Console.';
+    case 'forbidden': return 'Only an admin or this series\' runner can do that.';
+    case 'auth_unavailable': return 'The login check is not answering. Try again in a moment.';
+    case 'bad_payload': return 'The message was not accepted (' + (data.field || 'unknown field') + ').';
+    default: return 'Not sent (' + ((data && data.error) || 'unknown error') + ').';
+  }
+}
+
+/* Builds the message for the game from the same state the card uses.
+   Returns { payload } or { problem: 'text for the user' }. */
+function buildRadioPayload() {
+  syncAllRepliesFromDOM();
+  const clean = t => String(t || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().replace(/^"+|"+$/g, '').trim();
+  const all = [{ type: msgType, quote: document.getElementById('quoteText').value, sender: document.getElementById('senderName').value }].concat(replies);
+  const lines = all.map(m => ({
+    from: m.type === 'team' ? 'engineer' : 'driver',
+    label: m.type === 'team' ? clean(m.sender || 'ENGINEER').toUpperCase().slice(0, 24) : '',
+    text: clean(m.quote),
+  })).filter(l => l.text);
+  if (!lines.length) return { problem: 'Write a message first.' };
+  if (lines.length > RADIO_MAX_LINES) return { problem: 'The game shows at most ' + RADIO_MAX_LINES + ' messages at once. Remove a reply.' };
+  const long = lines.findIndex(l => l.text.length > RADIO_MAX_CHARS);
+  if (long >= 0) return { problem: 'Message ' + (long + 1) + ' is too long for the game (' + lines[long].text.length + ' of ' + RADIO_MAX_CHARS + ' characters).' };
+
+  // The in-game panel is narrow and, like the game's own radio panel, shows
+  // only the last name.
+  const name = clean(document.getElementById('driverName').value).toUpperCase().split(/\s+/).pop().slice(0, 24);
+  if (!name) return { problem: 'Pick a driver first.' };
+  const hex = v => /^#[0-9a-f]{6}$/i.test(String(v || '').trim()) ? String(v).trim().toLowerCase() : '';
+  const colour = hex(document.getElementById('nameColor').value) || hex(document.getElementById('accentColor').value) || '#ffffff';
+  let logo = document.getElementById('logoUrl').value.trim();
+  if (!/^logos\/[A-Za-z0-9 _()./-]+\.(png|webp|svg|jpg|jpeg)$/.test(logo) || logo.includes('..') || logo.includes('//')) logo = '';
+
+  return { payload: {
+    name,
+    number: clean(document.getElementById('carNumber').value).slice(0, 3),
+    team: clean(document.getElementById('teamLabel').value).toUpperCase().slice(0, 40),
+    colour,
+    textColour: '#ffffff',
+    logo,
+    lines,
+  } };
+}
+
+async function sendToGame() {
+  if (liveBusy) return;
+  const s = radioSession();
+  if (!s) {
+    setLiveResult('', 'bad', 'Log in at the <a href="BTG_DriverAttributes.html">Driver Console</a> first, then come back.');
+    return;
+  }
+  const built = buildRadioPayload();
+  if (built.problem) { setLiveResult(built.problem, 'bad'); return; }
+  liveBusy = true; setLiveResult('Sending…'); updateLiveUi();
+  try {
+    const data = await radioRpc('radio_send', { p_token: s.token, p_series: activeSeries, p_payload: built.payload });
+    if (data.ok) {
+      setLiveResult('Sent to the ' + (seriesDisplayName(activeSeries) || '') + ' host\'s game.', 'good');
+      liveCooldownUntil = Date.now() + RADIO_COOLDOWN_MS;
+    } else {
+      setLiveResult(radioErrorText(data), 'bad');
+      if (data.error === 'radio_off') liveEnabled = false;
+      if (data.error === 'too_fast') liveCooldownUntil = Date.now() + RADIO_COOLDOWN_MS;
+    }
+  } catch (_) {
+    setLiveResult('Could not reach the server. Not sent.', 'bad');
+  }
+  liveBusy = false; updateLiveUi();
+}
+
+setInterval(updateLiveUi, 1000);        // cooldown countdown
+setInterval(refreshLiveRadio, 30000);   // pick up the host switching radio on or off
 
 /* ─── event listeners ───────────────────────────────────── */
 document.getElementById('quoteText').addEventListener('input', render);
